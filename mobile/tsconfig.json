@@ -1,0 +1,16 @@
+{
+  "extends": "@react-native/typescript-config/tsconfig.json",
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "types": ["react", "react-native", "node"],
+    "allowImportingTsExtensions": true,
+    "esModuleInterop": true,
+    "baseUrl": ".",
+    "paths": {
+      "@mobile/*": ["src/*"],
+      "@bloks/core": ["../packages/bloks-core/src"]
+    }
+  },
+  "include": ["App.tsx", "index.js", "src", "declarations.d.ts"]
+}

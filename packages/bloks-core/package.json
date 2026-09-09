@@ -1,0 +1,12 @@
+{
+  "name": "@bloks/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./api": "./src/api.ts",
+    "./contracts": "./src/contracts.ts",
+    "./events": "./src/events.ts"
+  }
+}

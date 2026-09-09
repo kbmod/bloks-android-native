@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- The desktop harness currently exposes direct pairing over HTTP.
+         This resource exists only in debug; production stays HTTPS-only. -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Release builds reject cleartext. The debug overlay permits LAN HTTP
+         only while developing against the local harness. -->
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>
