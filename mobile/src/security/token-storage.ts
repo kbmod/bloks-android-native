@@ -21,11 +21,13 @@ export interface PairedConnection {
 export interface SecureConnectionStorage extends SecureTokenStorage {
   readConnection(): Promise<PairedConnection | null>;
   writeConnection(connection: PairedConnection): Promise<void>;
+  /** Persist the bearer token and non-secret connection metadata in one record. */
+  writePairedConnection(token: string, connection: PairedConnection): Promise<void>;
   clearConnection(): Promise<void>;
 }
 
-export function assertTokenShape(token: string): void {
-  if (!token || token.length < 32 || token.length > 512 || /[\u0000-\u001f\u007f\s]/.test(token)) {
+export function assertTokenShape(token: unknown): asserts token is string {
+  if (typeof token !== "string" || token.length < 32 || token.length > 512 || /[\u0000-\u001f\u007f\s]/.test(token)) {
     throw new Error("the server returned an invalid device token");
   }
 }

@@ -39,6 +39,16 @@ test("event cursor preserves sequence across hello replay", () => {
   assert.equal(gap.consumeRehydrate(), true);
 });
 
+test("event cursor resets its sequence when a restarted server says hello lower", () => {
+  const cursor = new EventStreamCursor();
+  cursor.observe('{"kind":"hello","_seq":20,"resumed":true}');
+  cursor.observe('{"kind":"message","_seq":21}');
+  const hello = cursor.observe('{"kind":"hello","_seq":2,"resumed":true}');
+  assert.equal(hello?.sequence, 2);
+  assert.equal(cursor.lastSequence, 2);
+  assert.equal(cursor.nextPath(), "/api/events?since=2");
+});
+
 test("typed API client injects bearer and throws bounded API errors", async () => {
   let seen: RequestInit | undefined;
   const client = new ApiClient({

@@ -98,6 +98,10 @@ export class EventStreamCursor {
     const sequence = typeof frame._seq === "number" && Number.isFinite(frame._seq) ? frame._seq : null;
     if (sequence !== null) this.sequence = Math.max(this.sequence, sequence);
     if (frame.kind === "hello") {
+      // A lower hello sequence identifies a restarted server/event log. Do
+      // not keep asking the new server for a cursor that only existed in the
+      // previous epoch.
+      if (sequence !== null && sequence < this.sequence) this.sequence = sequence;
       this.replayUntil = sequence ?? 0;
       this.rehydrate = (frame as EventFrame & { resumed?: unknown }).resumed === false;
       return { frame, sequence, replayed: false, rehydrate: this.rehydrate };
