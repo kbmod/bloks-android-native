@@ -23,7 +23,7 @@ import { noticeFor } from "@/lib/notify";
 import { maybeAutoSpeak } from "@/components/Voice";
 import {
   findCard,
-  initialState,
+  createInitialState,
   reducer,
   type Action,
   type AppState,
@@ -32,6 +32,37 @@ import {
 } from "./reducer";
 
 export * from "./reducer";
+
+function persistedValue(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function webInitialState() {
+  return createInitialState({
+    selectedId: persistedValue("bloks-selected") ?? "",
+    projectId: persistedValue("bloks-project"),
+  });
+}
+
+function persistValue(key: string, value: string | null) {
+  try {
+    if (value) localStorage.setItem(key, value);
+    else localStorage.removeItem(key);
+  } catch {
+    // Private browsing or a disabled storage backend: state remains usable.
+  }
+}
+
+function webReducer(state: AppState, action: Action): AppState {
+  const next = reducer(state, action);
+  if (next.selectedId !== state.selectedId) persistValue("bloks-selected", next.selectedId);
+  if (next.projectId !== state.projectId) persistValue("bloks-project", next.projectId);
+  return next;
+}
 
 // ── talking to the harness ─────────────────────────────────────────────
 export async function api(path: string, init?: RequestInit): Promise<any> {
@@ -50,7 +81,7 @@ const StoreContext = createContext<{
 } | null>(null);
 
 export function StoreProvider({ children }: { children: ReactNode }) {
-  const [state, rawDispatch] = useReducer(reducer, initialState);
+  const [state, rawDispatch] = useReducer(webReducer, undefined, webInitialState);
   const stateRef = useRef(state);
   stateRef.current = state;
 

@@ -7,6 +7,7 @@
     ".": "./src/index.ts",
     "./api": "./src/api.ts",
     "./contracts": "./src/contracts.ts",
-    "./events": "./src/events.ts"
+    "./events": "./src/events.ts",
+    "./reducer": "./src/reducer.ts"
   }
 }

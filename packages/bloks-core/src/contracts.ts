@@ -152,6 +152,18 @@ export interface Blok {
   messages: Message[];
 }
 
+export interface NewAgentProfile {
+  name?: string;
+  title?: string;
+  description?: string;
+  color?: BlokColor;
+  shape?: BlokShape;
+  skills?: string[];
+  skillIds?: string[];
+  greeting?: string;
+  setup?: { title: string; subtitle: string; options: string[] };
+}
+
 export interface InstanceInfo {
   instanceId: string;
   driverKind: string;
@@ -183,9 +195,18 @@ export interface ConfigStatus {
   xai?: { configured: boolean };
   composio: { configured: boolean; apiKeyConfigured?: boolean };
   box: { configured: boolean };
+  speech?: { elevenlabs: boolean; openai: boolean; openaiSource?: "env" | "codex"; openaiAvailable?: "env" | "codex" };
   profile?: { about: string };
   compaction?: { micro: boolean };
   skills?: { propose: boolean };
+}
+
+export interface Skill {
+  id: string;
+  name: string;
+  description: string;
+  body: string;
+  source: "builtin" | "user";
 }
 
 export interface PairingStatus {
