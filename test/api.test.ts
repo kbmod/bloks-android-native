@@ -2051,6 +2051,193 @@ describe("task lanes", () => {
   });
 });
 
+describe("message routing and lane admission", () => {
+  async function streamingGrok(t: any, pauseCompaction = false) {
+    const { createServer } = await import("node:http");
+    let providerTurns = 0;
+    let compactionStartedResolve!: () => void;
+    const compactionStarted = new Promise<void>((resolve) => {
+      compactionStartedResolve = resolve;
+    });
+    let releaseCompaction!: () => void;
+    const compactionGate = new Promise<void>((resolve) => {
+      releaseCompaction = resolve;
+    });
+    let paused = false;
+    const fake = createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        void (async () => {
+          if (req.url?.endsWith("/models")) {
+            res.writeHead(200, { "content-type": "application/json" });
+            return res.end(JSON.stringify({ data: [{ id: "tiny-1" }] }));
+          }
+          const parsed = JSON.parse(body || "{}");
+          if (parsed.stream === false) {
+            if (pauseCompaction && !paused) {
+              paused = true;
+              compactionStartedResolve();
+              await compactionGate;
+            }
+            res.writeHead(200, { "content-type": "application/json" });
+            return res.end(
+              JSON.stringify({
+                choices: [{ message: { role: "assistant", content: "the earlier context is folded" } }],
+              }),
+            );
+          }
+          providerTurns++;
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          return res.end("data: [DONE]\n\n");
+        })();
+      });
+    });
+    await new Promise<void>((resolve) => fake.listen(0, "127.0.0.1", resolve));
+    t.after(() => {
+      releaseCompaction();
+      fake.close();
+    });
+    await h.fetch("/api/providers/llama/connect", {
+      method: "POST",
+      body: JSON.stringify({
+        key: "llama-test-000000000000",
+        url: `http://127.0.0.1:${(fake.address() as any).port}`,
+      }),
+    });
+    return {
+      providerTurns: () => providerTurns,
+      waitForCompaction: () =>
+        Promise.race([
+          compactionStarted,
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("compaction did not start")), 5_000)),
+        ]),
+      releaseCompaction,
+    };
+  }
+
+  async function tinyBot(name: string) {
+    const { bot } = await h.json("/api/bots", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    });
+    await h.fetch(`/api/bots/${bot.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ modelSelection: { instanceId: "llama", model: "tiny-1" } }),
+    });
+    return bot;
+  }
+
+  test("an explicit task id routes to that lane and rejects a foreign task", async (t) => {
+    await streamingGrok(t);
+    const bot = await tinyBot("Explicit task target");
+    const targetTaskId = bot.activeTaskId;
+    const made = await h.json(`/api/bots/${bot.id}/tasks`, {
+      method: "POST",
+      body: JSON.stringify({ title: "Current task" }),
+    });
+    const activeTaskId = made.bot.activeTaskId;
+    assert.notEqual(activeTaskId, targetTaskId);
+
+    const sent = await h.fetch(`/api/bots/${bot.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ text: "deliver this to the named lane", taskId: targetTaskId }),
+    });
+    assert.equal(sent.status, 202);
+    await waitFor(async () => {
+      const { bots } = await h.json("/api/bots");
+      const current = bots.find((candidate: any) => candidate.id === bot.id);
+      const lane = current?.tasks.find((task: any) => task.id === targetTaskId);
+      return lane && lane.state === "idle" ? lane : null;
+    });
+
+    // Keep the other lane active while inspecting it: the named message must
+    // not have followed whatever lane happens to be on screen.
+    const stillCurrent = await h.json(`/api/bots/${bot.id}/tasks/${activeTaskId}/activate`, { method: "POST" });
+    assert.ok(
+      !stillCurrent.bot.messages.some((message: any) => message.text === "deliver this to the named lane"),
+      "the explicit message leaked into the active lane",
+    );
+    const target = await h.json(`/api/bots/${bot.id}/tasks/${targetTaskId}/activate`, { method: "POST" });
+    assert.ok(
+      target.bot.messages.some((message: any) => message.role === "user" && message.text === "deliver this to the named lane"),
+      "the explicit message did not reach its task",
+    );
+
+    const foreign = await h.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Foreign task owner" }) });
+    const wrong = await h.fetch(`/api/bots/${bot.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ text: "must not be delivered", taskId: foreign.bot.activeTaskId }),
+    });
+    assert.equal(wrong.status, 404);
+    const malformed = await h.fetch(`/api/bots/${bot.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ text: "must not be delivered", taskId: null }),
+    });
+    assert.equal(malformed.status, 400);
+
+    const wrongInterrupt = await h.fetch(`/api/bots/${bot.id}/interrupt`, {
+      method: "POST",
+      body: JSON.stringify({ taskId: foreign.bot.activeTaskId }),
+    });
+    assert.equal(wrongInterrupt.status, 404);
+    const malformedInterrupt = await h.fetch(`/api/bots/${bot.id}/interrupt`, {
+      method: "POST",
+      body: JSON.stringify({ taskId: null }),
+    });
+    assert.equal(malformedInterrupt.status, 400);
+
+    await h.fetch(`/api/bots/${bot.id}?forget=1`, { method: "DELETE" });
+    await h.fetch(`/api/bots/${foreign.bot.id}?forget=1`, { method: "DELETE" });
+  });
+
+  test("a concurrent send queues while admission is paused for compaction", async (t) => {
+    const fake = await streamingGrok(t, true);
+    const bot = await tinyBot("Admission race");
+    const long = "context ".repeat(2_125); // just over 17k chars, under the message cap
+    for (let i = 0; i < 6; i++) {
+      const sent = await h.fetch(`/api/bots/${bot.id}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ text: `${i}: ${long}` }),
+      });
+      assert.equal(sent.status, 202);
+      await waitFor(async () => {
+        const { bots } = await h.json("/api/bots");
+        const current = bots.find((candidate: any) => candidate.id === bot.id);
+        return current && !current.busy ? current : null;
+      });
+    }
+    const before = fake.providerTurns();
+
+    const first = h.fetch(`/api/bots/${bot.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ text: "the first message starts compaction" }),
+    });
+    await fake.waitForCompaction();
+
+    const second = await h.fetch(`/api/bots/${bot.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ text: "the second message waits behind it" }),
+    });
+    assert.equal(second.status, 202);
+    assert.deepEqual(await second.json(), { ok: true, queued: true });
+    assert.equal(fake.providerTurns(), before, "the queued send started a provider turn during compaction");
+
+    fake.releaseCompaction();
+    assert.equal((await first).status, 202);
+    const settled = await waitFor(async () => {
+      const { bots } = await h.json("/api/bots");
+      const current = bots.find((candidate: any) => candidate.id === bot.id);
+      return current && !current.busy ? current : null;
+    });
+    assert.ok(settled, "the admitted turn did not settle");
+    assert.equal(fake.providerTurns(), before + 2, "the queued message did not drain as one follow-up turn");
+    assert.ok(settled.messages.some((message: any) => message.queued === false && message.text === "the second message waits behind it"));
+
+    await h.fetch(`/api/bots/${bot.id}?forget=1`, { method: "DELETE" });
+  });
+});
+
 describe("the tool loop for API engines", () => {
   /**
    * A fake OpenAI-compatible provider. First completion answers with an

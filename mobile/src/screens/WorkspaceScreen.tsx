@@ -1,9 +1,9 @@
-import React, {useCallback, useEffect, useMemo, useSyncExternalStore, useState} from 'react';
-import {AppState, ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View} from 'react-native';
+import React, {useCallback, useSyncExternalStore, useState} from 'react';
+import {ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View} from 'react-native';
 import type {NativeStackScreenProps} from '@react-navigation/native-stack';
 import type {RootStackParamList} from '../../App';
-import {useConnection} from '../connection/context';
-import {WorkspaceSessionCoordinator, type WorkspaceSessionSnapshot, type WorkspaceSessionStatus} from '../workspace/session-coordinator';
+import {useConnection, useWorkspaceSession} from '../connection/context';
+import type {WorkspaceSessionSnapshot, WorkspaceSessionStatus} from '../workspace/session-coordinator';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Workspace'>;
 
@@ -25,30 +25,17 @@ const STATUS_LABEL: Record<WorkspaceSessionStatus, string> = {
 };
 
 export function WorkspaceScreen({navigation}: Props) {
-  const {connection, storage, disconnect} = useConnection();
+  const {connection, disconnect} = useConnection();
+  const coordinator = useWorkspaceSession();
   const [forgetting, setForgetting] = useState(false);
-  const coordinator = useMemo(
-    () => connection ? new WorkspaceSessionCoordinator({baseUrl: connection.baseUrl, storage}) : null,
-    [connection, storage],
-  );
   const subscribe = useCallback((listener: () => void) => coordinator?.subscribe(listener) ?? (() => {}), [coordinator]);
   const getSnapshot = useCallback(() => coordinator?.snapshot ?? EMPTY_SNAPSHOT, [coordinator]);
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
-  useEffect(() => {
-    if (!coordinator) return;
-    void coordinator.start();
-    const appState = AppState.addEventListener('change', (next) => {
-      if (next === 'active') void coordinator.start();
-      else if (next === 'background' || next === 'inactive') coordinator.stop();
-    });
-    return () => { appState.remove(); coordinator.stop(); };
-  }, [coordinator]);
 
   async function onForget() {
     setForgetting(true);
     try {
-      coordinator?.stop();
       await disconnect();
       navigation.reset({index: 0, routes: [{name: 'Pairing'}]});
     } finally {
@@ -93,7 +80,16 @@ export function WorkspaceScreen({navigation}: Props) {
       {state.bots.length === 0
         ? <Text style={styles.empty}>No agents yet.</Text>
         : state.bots.map((bot) => (
-          <View key={bot.id} style={[styles.row, bot.hidden && styles.archivedRow]}>
+          <Pressable
+            key={bot.id}
+            accessibilityRole="button"
+            onPress={() => navigation.navigate('Conversation', {
+              botId: bot.id,
+              taskId: bot.activeTaskId ?? bot.threadId,
+              threadId: bot.threadId,
+            })}
+            style={[styles.row, bot.hidden && styles.archivedRow]}
+          >
             <View style={styles.rowMain}>
               <Text style={styles.rowTitle}>{bot.name || bot.title || 'Unnamed agent'}</Text>
               <Text style={styles.rowMeta}>{bot.hidden ? 'Archived' : bot.busy ? 'Busy' : 'Idle'}{bot.unread ? ' · Unread' : ''}</Text>
@@ -101,7 +97,7 @@ export function WorkspaceScreen({navigation}: Props) {
             <View style={[styles.badge, bot.hidden ? styles.archivedBadge : bot.busy ? styles.busyBadge : styles.idleBadge]}>
               <Text style={styles.badgeText}>{bot.hidden ? 'ARCHIVED' : bot.busy ? 'BUSY' : 'READY'}</Text>
             </View>
-          </View>
+          </Pressable>
         ))}
 
       <Text style={styles.sectionTitle}>Rooms</Text>

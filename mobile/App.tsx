@@ -5,6 +5,7 @@ import {ActivityIndicator, StyleSheet, Text, View} from 'react-native';
 import {SafeAreaProvider} from 'react-native-safe-area-context';
 import {PairingScreen} from './src/screens/PairingScreen';
 import {WorkspaceScreen} from './src/screens/WorkspaceScreen';
+import {ConversationScreen} from './src/screens/ConversationScreen';
 import {ConnectionProvider} from './src/connection/context';
 import {restoreSavedConnection} from './src/connection/connection-bootstrap';
 import type {PairedConnection, SecureConnectionStorage} from './src/security/token-storage';
@@ -13,6 +14,7 @@ import {createSecureConnectionStorage} from './src/security/react-native-keychai
 export type RootStackParamList = {
   Pairing: {address?: string; token?: string; code?: string; name?: string} | undefined;
   Workspace: undefined;
+  Conversation: {botId: string; taskId: string; threadId: string};
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -60,6 +62,7 @@ export default function App() {
           <Stack.Navigator initialRouteName={initialConnection ? 'Workspace' : 'Pairing'} screenOptions={{headerShown: false}}>
             <Stack.Screen name="Pairing" component={PairingScreen} />
             <Stack.Screen name="Workspace" component={WorkspaceScreen} />
+            <Stack.Screen name="Conversation" component={ConversationScreen} />
           </Stack.Navigator>
         </NavigationContainer>
       </SafeAreaProvider>

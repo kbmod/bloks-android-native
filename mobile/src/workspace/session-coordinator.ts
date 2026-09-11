@@ -80,6 +80,11 @@ export class WorkspaceSessionCoordinator {
     return this.snapshotValue;
   }
 
+  /** Authenticated client shared by roster and conversation commands. */
+  get apiClient(): ApiClient {
+    return this.client;
+  }
+
   subscribe(listener: Listener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -167,12 +172,16 @@ export class WorkspaceSessionCoordinator {
 
   private requestRehydrate(): void {
     if (!this.active) return;
+    // The hello/replay-gap callback is asynchronous. Capture the lifecycle
+    // generation at the point the gap was observed so a late rejection from
+    // this hydration cannot tear down a newer stop/start session.
+    const generation = this.generation;
     this.setStatus("hydrating");
-    void this.rehydrate().catch((error) => this.handleHydrationFailure(error));
+    void this.rehydrate(generation).catch((error) => this.handleHydrationFailure(error, generation));
   }
 
-  private handleHydrationFailure(error: unknown): void {
-    if (!this.active) return;
+  private handleHydrationFailure(error: unknown, generation = this.generation): void {
+    if (!this.active || generation !== this.generation) return;
     this.active = false;
     this.generation += 1;
     this.streamConnected = false;

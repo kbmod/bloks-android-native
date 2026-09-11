@@ -31,6 +31,14 @@
   unauthorized and unreachable states.
 - Wired the connection lifecycle into a native agent and room roster with
   connection, busy, unread, and archived indicators.
+- Lifted workspace-session ownership above navigation so opening an agent chat
+  never creates a second coordinator, SSE connection, or provider turn owner.
+  This preserves the live-owner invariant behind the Hermes Agent Bot Chat
+  deadlock fix: Android submits commands only through the harness-owned lane.
+- Added the first Phase 5 agent conversation screen with a virtualized native
+  transcript, queued/deleted and activity rows, a separate streaming response,
+  sending and interrupt controls, and explicit ambiguous-delivery handling that
+  retains the draft and never retries automatically.
 - Installed Android Emulator 37.1.11 and an API 35 Google APIs x86_64 system
   image, and created the `bloks-phase0-api35` AVD.
 - Corrected the Android activity theme to inherit from AppCompat after the
@@ -43,11 +51,14 @@
   pins.
 - Focused reducer/core/network, connection-storage, hydration, event-stream,
   pairing, and workspace-session tests: passed.
-- Full desktop test suite with normal host permissions: 1,035 passed, 2
-  skipped, 0 failed. A restricted-sandbox run failed on process, listener, and
-  temporary-file permissions and was not treated as host evidence.
+- Full desktop test suite with normal host permissions: 1,049 passed, 2
+  skipped, 0 failed. A
+  restricted-sandbox run failed on process, listener, and temporary-file
+  permissions and was not treated as host evidence.
 - `react-native config`: reports Android package name `dev.bloks.mobile` and
   discovers the native dependencies.
+- A clean Metro Android bundle passed after expanding the monorepo watch root
+  for pnpm symlink targets and enabling workspace package exports.
 - `git diff --check`: passed.
 - `./gradlew --no-daemon assembleDebug`: passed with Node 22.23.1, Java 21,
   Android SDK `/home/brit/.local/share/android-sdk`, and Gradle 8.12. The
@@ -62,15 +73,17 @@
   limits.
 - The AVD booted successfully once and the APK installed. Its first launch
   exposed the AppCompat theme mismatch now fixed in source. Later emulator
-  retries could not remain visible to ADB from the restricted task process, so
-  the corrected APK still needs a final install/launch smoke test.
+  retries, including three clean host-side KVM boots, exited before ADB
+  registration. The corrected APK still needs a final install/launch smoke test
+  on a fresh AVD or physical device.
 - Harness LAN binding and pairing mode were not changed.
 
 ### Next task
 
-Run the corrected APK on the existing AVD or a physical Android device and
-complete a real pairing/hydration check against a LAN-enabled harness. After
-that, begin the Phase 5 transcript and composer increment.
+Run the corrected APK on a fresh AVD or physical Android device and complete a
+real pairing, hydration, send, stream, queue, and interrupt check against a
+LAN-enabled harness. After that, continue Phase 5 transcript polish or begin
+the Phase 6 approval-card and room-conversation increment.
 
 ### Architecture deviations
 

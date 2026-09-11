@@ -65,6 +65,29 @@ test("snapshot identity is cached and live frames notify roster subscribers", as
   assert.ok(notifications > 0);
 });
 
+test("repeated starts share one transport owner for roster and conversation mounts", async () => {
+  let created = 0;
+  let transport: FakeTransport | undefined;
+  const session = new WorkspaceSessionCoordinator({
+    baseUrl: "https://example.test",
+    storage: storage(),
+    hydrate: async () => workspace,
+    transportFactory: (options) => {
+      created += 1;
+      transport = new FakeTransport(options);
+      return transport;
+    },
+  });
+  await Promise.all([session.start(), session.start(), session.start()]);
+  assert.equal(created, 1);
+  assert.equal(transport?.starts, 1);
+  session.stop();
+  // A stopped session is not resurrected by a late frame from an unmounted
+  // screen; the provider owns the one stop/start boundary.
+  transport?.options.onData('{"kind":"hello","_seq":2,"resumed":true}');
+  assert.equal(session.snapshot.status, "stopped");
+});
+
 test("replay gaps trigger a second hydration and status transitions remain bounded", async () => {
   let hydrated = 0;
   let transport: FakeTransport | undefined;
@@ -85,6 +108,51 @@ test("replay gaps trigger a second hydration and status transitions remain bound
   transport?.options.onStatus?.({kind: "reconnecting", delayMs: 10, reason: "unreachable"});
   assert.equal(session.snapshot.status, "reconnecting");
   unsubscribe();
+});
+
+test("a stale replay-gap hydration rejection cannot stop a newer session", async () => {
+  let hydrated = 0;
+  let staleReject: ((error: unknown) => void) | undefined;
+  const transports: FakeTransport[] = [];
+  const session = new WorkspaceSessionCoordinator({
+    baseUrl: "https://example.test",
+    storage: storage(),
+    hydrate: async () => {
+      hydrated += 1;
+      if (hydrated === 2) {
+        return new Promise<MobileHydratedWorkspace>((_resolve, reject) => { staleReject = reject; });
+      }
+      return workspace;
+    },
+    transportFactory: (options) => {
+      const transport = new FakeTransport(options);
+      transports.push(transport);
+      return transport;
+    },
+  });
+
+  await session.start();
+  const firstTransport = transports[0];
+  firstTransport?.options.onData('{"kind":"hello","_seq":4,"resumed":false}');
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  assert.equal(hydrated, 2);
+  assert.equal(session.snapshot.status, "hydrating");
+
+  // This is the app-background stop/start boundary. The new generation must
+  // own status and transport even while the old replay hydration is pending.
+  session.stop();
+  await session.start();
+  assert.equal(hydrated, 3);
+  assert.equal(transports.length, 2);
+  assert.equal(transports[1]?.starts, 1);
+  assert.equal(session.snapshot.status, "connected");
+  assert.equal(session.snapshot.state.connected, true);
+
+  staleReject?.(new Error("late replay hydration failed"));
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  assert.equal(session.snapshot.status, "connected");
+  assert.equal(session.snapshot.state.connected, true);
+  assert.equal(transports[1]?.stops, 0);
 });
 
 test("stop fully disconnects the stream and prevents later frames from changing state", async () => {

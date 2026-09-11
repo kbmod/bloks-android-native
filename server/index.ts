@@ -878,6 +878,10 @@ bus.subscribe((event: RuntimeEvent) => {
       usage.recordTurn(bot.id, event.providerInstanceId ?? event.provider, event.cost ?? null);
       const spent = turnTokens.get(event.threadId);
       turnTokens.delete(event.threadId);
+      // A reservation only covers admission/preflight. Release it before
+      // clearing busy and draining steering, so a queued follow-up can claim
+      // the lane exactly once.
+      turnAdmissions.delete(event.threadId);
       // only solo lanes tally; a room's spend belongs to no one lane.
       // solo turns map the lane to itself, room turns map it elsewhere
       const spoke = activeRoom.get(event.threadId);
@@ -1101,6 +1105,15 @@ const askThreadByRequest = new Map<string, string>();
  * rather than as zero.
  */
 const turnStarted = new Map<string, number>();
+/** Lanes admitted but still doing synchronous setup or pre-turn work. A
+ * context fold can await before the persisted busy bit is set; this
+ * reservation closes that gap without holding a mutex across provider work. */
+const turnAdmissions = new Set<string>();
+
+function dropTurnAdmission(taskId: string) {
+  turnAdmissions.delete(taskId);
+  activeRoom.delete(taskId);
+}
 
 /** Highest seniority wins; ties break toward the earliest member listed. */
 function leadOf(members: BotRecord[]): BotRecord | null {
@@ -1284,7 +1297,7 @@ async function startTurn(
   // the gate is the lane: other lanes keep their own turns running
   const task = bot.tasks.find((t) => t.id === (opts.taskId ?? bot.activeTaskId)) ?? bot.tasks[0];
   if (!task) throw Object.assign(new Error("no task lane on this agent"), { status: 500 });
-  if (task.busy) {
+  if (task.busy || turnAdmissions.has(task.id)) {
     throw Object.assign(new Error("this task is already running, interrupt it or open another task"), {
       status: 409,
     });
@@ -1297,6 +1310,12 @@ async function startTurn(
       { status: 409 },
     );
   }
+
+  // Admission is synchronous and per lane. In particular, do this before
+  // the first await below: context compaction may call a model, and a second
+  // message arriving during that wait must see a claimed lane and queue
+  // behind it instead of entering a second provider turn.
+  turnAdmissions.add(task.id);
 
   // where the reply lands: the lane's own thread, or the shared room
   const roomId = opts.roomId ?? task.id;
@@ -1312,19 +1331,25 @@ async function startTurn(
     : [];
   // keyed by the lane, so a room turn in one lane never bleeds messages
   // into a solo turn running in another
-  activeRoom.set(task.id, roomId);
+  try {
+    activeRoom.set(task.id, roomId);
 
-  // In a room the prompt already carries the labelled history, and the
-  // triggering message is already on the record; only a solo chat writes
-  // the user turn here.
-  if (!blok && !opts.presetMessage) {
-    const userMessage = store.appendMessage(roomId, {
-      role: "user",
-      kind: "text",
-      text,
-      ...(opts.replyTo ? { replyTo: opts.replyTo } : {}),
-    });
-    broadcast({ kind: "message", threadId: roomId, message: userMessage });
+    // In a room the prompt already carries the labelled history, and the
+    // triggering message is already on the record; only a solo chat writes
+    // the user turn here.
+    if (!blok && !opts.presetMessage) {
+      const userMessage = store.appendMessage(roomId, {
+        role: "user",
+        kind: "text",
+        text,
+        ...(opts.replyTo ? { replyTo: opts.replyTo } : {}),
+      });
+      broadcast({ kind: "message", threadId: roomId, message: userMessage });
+    }
+  } catch (e) {
+    dropTurnAdmission(task.id);
+    drainSteer(task.id);
+    throw e;
   }
 
   // ── the transcript for API-backed drivers ──
@@ -1357,9 +1382,16 @@ async function startTurn(
   // rather than dropped. Comparing the trimmed transcript against the
   // limit would never fire, because trimming is what makes it fit, and
   // the trimming is exactly the silent forgetting this replaces.
-  let built = buildTranscript();
-  if (!blok && built.dropped > 0) {
-    if (await foldContext(bot.id, task.id).catch(() => false)) built = buildTranscript();
+  let built: { turns: Turn[]; dropped: number };
+  try {
+    built = buildTranscript();
+    if (!blok && built.dropped > 0) {
+      if (await foldContext(bot.id, task.id).catch(() => false)) built = buildTranscript();
+    }
+  } catch (e) {
+    dropTurnAdmission(task.id);
+    drainSteer(task.id);
+    throw e;
   }
   const transcript = built.turns;
 
@@ -1427,6 +1459,12 @@ async function startTurn(
   if (stillHeld) {
     wheel.noteTurnedAway(bot.id);
     broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
+    // Admission happened before the compaction await; do not leave the
+    // lane reserved when the wheel wins that race. Any steering item that
+    // arrived while admission was paused gets the same held refusal on its
+    // own attempted drain rather than remaining stranded forever.
+    dropTurnAdmission(task.id);
+    drainSteer(task.id);
     throw Object.assign(new Error(heldRefusal(stillHeld, bot.name)), { status: 409, held: true });
   }
 
@@ -1434,26 +1472,50 @@ async function startTurn(
   // the instant someone presses send. The dispatch itself is deliberately
   // not awaited: provisioning a box can take a minute and a half, and an
   // HTTP request must never be the thing holding that open.
-  store.setTaskBusy(task.id, true);
-  turnStarted.set(task.id, Date.now());
-  store.patchBot(bot.id, { unread: false });
-  artifactBaseline.set(task.id, artifacts.snapshot(bot.id));
-  turnTokens.delete(task.id);
-  broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
+  let busyMarked = false;
+  try {
+    // Set the marker before the write: if persistence throws after mutating
+    // the in-memory record, the cleanup below still returns the lane to idle.
+    busyMarked = true;
+    store.setTaskBusy(task.id, true);
+    turnStarted.set(task.id, Date.now());
+    store.patchBot(bot.id, { unread: false });
+    artifactBaseline.set(task.id, artifacts.snapshot(bot.id));
+    turnTokens.delete(task.id);
+    broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
+    // Once the durable busy bit is visible, it is the admission gate. The
+    // transient reservation is no longer needed and must not block draining.
+    turnAdmissions.delete(task.id);
 
-  // a lane still wearing its default "Task N" name adopts the first
-  // thing asked of it, kept very short so the strip reads like a to-do
-  // list. General keeps its name; it is the conversation, not a task.
-  if (!blok && /^Task \d+$/.test(task.title)) {
-    const words = text.replace(/\s+/g, " ").trim().split(" ");
-    let short = "";
-    for (const word of words.slice(0, 3)) {
-      const next = short ? `${short} ${word}` : word;
-      if (next.length > 24) break;
-      short = next;
+    // a lane still wearing its default "Task N" name adopts the first
+    // thing asked of it, kept very short so the strip reads like a to-do
+    // list. General keeps its name; it is the conversation, not a task.
+    if (!blok && /^Task \d+$/.test(task.title)) {
+      const words = text.replace(/\s+/g, " ").trim().split(" ");
+      let short = "";
+      for (const word of words.slice(0, 3)) {
+        const next = short ? `${short} ${word}` : word;
+        if (next.length > 24) break;
+        short = next;
+      }
+      short = (short || words[0].slice(0, 24)).replace(/[.,!?;:]+$/, "");
+      if (short) store.patchTaskTitle(bot.id, task.id, short);
     }
-    short = (short || words[0].slice(0, 24)).replace(/[.,!?;:]+$/, "");
-    if (short) store.patchTaskTitle(bot.id, task.id, short);
+  } catch (e) {
+    dropTurnAdmission(task.id);
+    artifactBaseline.delete(task.id);
+    turnTokens.delete(task.id);
+    turnStarted.delete(task.id);
+    if (busyMarked) {
+      try {
+        store.setTaskBusy(task.id, false);
+      } catch {
+        /* preserve the original setup failure */
+      }
+      broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
+    }
+    drainSteer(task.id);
+    throw e;
   }
 
   void (async () => {
@@ -1556,9 +1618,11 @@ async function startTurn(
             text: missingFolderMessage(project, gone),
           });
           broadcast({ kind: "message", threadId: roomId, message: notice });
+          dropTurnAdmission(task.id);
           store.setTaskBusy(task.id, false);
           turnStarted.delete(task.id);
           broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
+          drainSteer(task.id);
           return;
         }
       }
@@ -1644,7 +1708,7 @@ async function startTurn(
         broadcast({ kind: "message", threadId: roomId, message });
         return message;
       });
-      activeRoom.delete(task.id);
+      dropTurnAdmission(task.id);
       store.setTaskBusy(task.id, false);
       turnStarted.delete(task.id);
       broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
@@ -3012,7 +3076,7 @@ async function sendUserMessage(botId: string, text: string, options: { taskId?: 
   if (bot.archivedAt) {
     throw Object.assign(new Error(`${bot.name} is archived. Restore it to give it work.`), { status: 409 });
   }
-  if (lane.busy) {
+  if (lane.busy || turnAdmissions.has(lane.id)) {
     const message = store.appendMessage(lane.id, {
       role: "user", kind: "text", text, queued: true,
       ...(options.replyTo ? { replyTo: options.replyTo } : {}),
@@ -3959,6 +4023,17 @@ const server = createServer(async (req, res) => {
     m = path.match(/^\/api\/bots\/([\w-]+)\/messages$/);
     if (m && method === "POST") {
       const body = await readBody(req);
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such agent" });
+      // A named task is an explicit routing contract. Do not silently fall
+      // back to the active task for malformed, unknown, or another agent's
+      // task id; desktop callers that omit taskId retain the old behavior.
+      if (body.taskId !== undefined && typeof body.taskId !== "string") {
+        return json(res, 400, { error: "taskId must be a task id" });
+      }
+      if (typeof body.taskId === "string" && !bot.tasks.some((task) => task.id === body.taskId)) {
+        return json(res, 404, { error: "no such task" });
+      }
       // Truncating would drop the tail of what someone wrote without
       // telling them, so an over-long message is refused instead.
       if (typeof body.text === "string" && body.text.length > MAX_MESSAGE_CHARS) {
@@ -3966,7 +4041,10 @@ const server = createServer(async (req, res) => {
       }
       const text = clamp(body.text, MAX_MESSAGE_CHARS);
       if (!text) return json(res, 400, { error: "text required" });
-      const result = await sendUserMessage(m[1], text, { replyTo: replyRef(body.replyTo) });
+      const result = await sendUserMessage(m[1], text, {
+        ...(typeof body.taskId === "string" ? { taskId: body.taskId } : {}),
+        replyTo: replyRef(body.replyTo),
+      });
       return json(res, 202, result);
     }
     // ── task lanes ──
@@ -4781,11 +4859,17 @@ const server = createServer(async (req, res) => {
       if (!bot) return json(res, 404, { error: "no such agent" });
       const body = await readBody(req).catch(() => ({}) as Record<string, unknown>);
       const instance = registry.get(bot.modelSelection.instanceId);
-      // a named lane is interruptible even when another lane is on screen
-      const laneId =
-        typeof body.taskId === "string" && bot.tasks.some((t) => t.id === body.taskId)
-          ? body.taskId
-          : bot.threadId;
+      // A named lane is interruptible even when another lane is on screen,
+      // but an invalid explicit target must never fall through to that other
+      // lane. Callers that omit taskId retain the desktop's active-lane
+      // behavior.
+      if (body.taskId !== undefined && typeof body.taskId !== "string") {
+        return json(res, 400, { error: "taskId must be a task id" });
+      }
+      if (typeof body.taskId === "string" && !bot.tasks.some((task) => task.id === body.taskId)) {
+        return json(res, 404, { error: "no such task" });
+      }
+      const laneId = typeof body.taskId === "string" ? body.taskId : bot.threadId;
       await instance?.adapter.interruptTurn(laneId);
       return json(res, 200, { ok: true });
     }
